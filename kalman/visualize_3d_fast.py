@@ -20,107 +20,134 @@ from scipy.spatial.transform import Rotation as R
 
 GYRO_BIAS = np.array([-0.093434, 0.038554, -0.004698])
 ACCEL_SCALE = 1.0
-MAG_OFFSET = np.array([0.0857, -0.7558, -0.6930])
+MAG_OFFSET = np.array([-0.0211, -0.0151, -0.4484])
 MAG_A = np.array([
-    [0.995363, 0.000293, 0.026286],
-    [0.000293, 0.950979, -0.001707],
-    [0.026286, -0.001707, 1.057143]
+    [1.010267, 0.023338, 0.018344],
+    [0.023338, 0.929476, 0.021666],
+    [0.018344, 0.021666, 1.066378]
 ])
 
 # ============================================================================
 
 
-class ComplementaryFilter:
+class MadgwickFilter:
     """
-    Fast complementary filter for IMU orientation.
-    Much faster response than UKF, perfect for visualization.
+    Madgwick AHRS filter for IMU orientation estimation.
+    Industry-standard algorithm, well-tested and proven.
+
+    Reference: Madgwick, S. (2010). "An efficient orientation filter for
+    inertial and inertial/magnetic sensor arrays"
     """
 
-    def __init__(self, dt=0.01, alpha=0.98):
+    def __init__(self, dt=0.01, beta=0.1):
         """
-        Initialize complementary filter.
+        Initialize Madgwick filter.
 
         Args:
             dt: Time step (seconds)
-            alpha: Filter weight (0.95-0.99). Higher = trust gyro more (faster response)
+            beta: Filter gain (0.01-0.5). Lower = trust gyro more, higher = trust accel/mag more
+                  Typical: 0.1 for fast response with good correction
         """
         self.dt = dt
-        self.alpha = alpha
+        self.beta = beta
 
         # Current orientation as quaternion [w, x, y, z]
         self.q = np.array([1.0, 0.0, 0.0, 0.0])
 
     def update(self, accel, gyro, mag):
         """
-        Update orientation with new sensor data.
+        Update orientation using Madgwick AHRS algorithm.
 
         Args:
             accel: Accelerometer [ax, ay, az] in m/s²
             gyro: Gyroscope [wx, wy, wz] in rad/s
             mag: Magnetometer [mx, my, mz] (calibrated)
         """
-        # ========================================
-        # STEP 1: Integrate gyroscope (high-frequency, fast response)
-        # ========================================
+        q = self.q
 
-        # Convert angular velocity to quaternion derivative
-        w_norm = np.linalg.norm(gyro)
-        if w_norm > 0:
-            angle = w_norm * self.dt
-            axis = gyro / w_norm
-            dq = np.array([
-                np.cos(angle/2),
-                axis[0] * np.sin(angle/2),
-                axis[1] * np.sin(angle/2),
-                axis[2] * np.sin(angle/2)
-            ])
-            q_gyro = self.quaternion_multiply(self.q, dq)
-        else:
-            q_gyro = self.q.copy()
+        # Normalize accelerometer measurement
+        accel_norm = np.linalg.norm(accel)
+        if accel_norm < 0.01:
+            # No valid accel data, just integrate gyro
+            return
+        accel = accel / accel_norm
 
-        # Normalize
-        q_gyro = q_gyro / np.linalg.norm(q_gyro)
+        # Normalize magnetometer measurement
+        mag_norm = np.linalg.norm(mag)
+        if mag_norm < 0.01:
+            # Fall back to 6DOF (IMU mode without magnetometer)
+            self._update_imu(accel, gyro)
+            return
+        mag = mag / mag_norm
 
-        # ========================================
-        # STEP 2: Calculate orientation from accel + mag (low-frequency, drift-free)
-        # ========================================
+        # Reference direction of Earth's magnetic field (in Earth frame)
+        h = self._quaternion_rotate(q, mag)
+        b = np.array([0, np.sqrt(h[0]**2 + h[1]**2), 0, h[2]])
 
-        # Normalize accelerometer
-        accel_norm = accel / np.linalg.norm(accel)
+        # Gradient descent algorithm corrective step
+        F = np.array([
+            2*(q[1]*q[3] - q[0]*q[2]) - accel[0],
+            2*(q[0]*q[1] + q[2]*q[3]) - accel[1],
+            2*(0.5 - q[1]**2 - q[2]**2) - accel[2],
+            2*b[1]*(0.5 - q[2]**2 - q[3]**2) + 2*b[3]*(q[1]*q[3] - q[0]*q[2]) - mag[0],
+            2*b[1]*(q[1]*q[2] - q[0]*q[3]) + 2*b[3]*(q[0]*q[1] + q[2]*q[3]) - mag[1],
+            2*b[1]*(q[0]*q[2] + q[1]*q[3]) + 2*b[3]*(0.5 - q[1]**2 - q[2]**2) - mag[2]
+        ])
 
-        # Normalize magnetometer
-        mag_norm = mag / np.linalg.norm(mag)
+        J = np.array([
+            [-2*q[2],                 2*q[3],                -2*q[0],                2*q[1]],
+            [ 2*q[1],                 2*q[0],                 2*q[3],                2*q[2]],
+            [ 0,                     -4*q[1],                -4*q[2],                0],
+            [-2*b[3]*q[2],            2*b[3]*q[3],          -4*b[1]*q[2]-2*b[3]*q[0], -4*b[1]*q[3]+2*b[3]*q[1]],
+            [-2*b[1]*q[3]+2*b[3]*q[1], 2*b[1]*q[2]+2*b[3]*q[0], 2*b[1]*q[1]+2*b[3]*q[3], -2*b[1]*q[0]+2*b[3]*q[2]],
+            [ 2*b[1]*q[2],            2*b[1]*q[3]-4*b[3]*q[1], 2*b[1]*q[0]-4*b[3]*q[2],  2*b[1]*q[1]]
+        ])
 
-        # Remove component of mag in direction of gravity
-        mag_horizontal = mag_norm - np.dot(mag_norm, accel_norm) * accel_norm
-        mag_horizontal = mag_horizontal / np.linalg.norm(mag_horizontal)
+        step = J.T @ F
+        step = step / np.linalg.norm(step)
 
-        # Build rotation matrix from accel and mag
-        # accel points down (Z axis in body frame)
-        # mag points north (X axis in horizontal plane)
+        # Compute rate of change of quaternion
+        q_dot = 0.5 * self.quaternion_multiply(q, np.array([0, gyro[0], gyro[1], gyro[2]])) - self.beta * step
 
-        # East = North × Down
-        east = np.cross(mag_horizontal, accel_norm)
-        east = east / np.linalg.norm(east)
+        # Integrate to yield quaternion
+        q = q + q_dot * self.dt
+        self.q = q / np.linalg.norm(q)
 
-        # North = Down × East (reorthogonalize)
-        north = np.cross(accel_norm, east)
+    def _update_imu(self, accel, gyro):
+        """6DOF update (without magnetometer)"""
+        q = self.q
 
-        # Build rotation matrix [North, East, Down]
-        R_am = np.column_stack([north, east, accel_norm])
+        # Gradient descent algorithm corrective step
+        F = np.array([
+            2*(q[1]*q[3] - q[0]*q[2]) - accel[0],
+            2*(q[0]*q[1] + q[2]*q[3]) - accel[1],
+            2*(0.5 - q[1]**2 - q[2]**2) - accel[2]
+        ])
 
-        # Convert to quaternion
-        q_accel_mag = self.rotation_matrix_to_quaternion(R_am)
+        J = np.array([
+            [-2*q[2], 2*q[3], -2*q[0], 2*q[1]],
+            [ 2*q[1], 2*q[0],  2*q[3], 2*q[2]],
+            [ 0,     -4*q[1], -4*q[2], 0]
+        ])
 
-        # ========================================
-        # STEP 3: Complementary filter (blend gyro and accel/mag)
-        # ========================================
+        step = J.T @ F
+        step = step / np.linalg.norm(step)
 
-        # Use SLERP (Spherical Linear Interpolation) for smooth blending
-        q_fused = self.slerp(q_accel_mag, q_gyro, self.alpha)
+        # Compute rate of change of quaternion
+        q_dot = 0.5 * self.quaternion_multiply(q, np.array([0, gyro[0], gyro[1], gyro[2]])) - self.beta * step
 
-        # Update state
-        self.q = q_fused / np.linalg.norm(q_fused)
+        # Integrate to yield quaternion
+        q = q + q_dot * self.dt
+        self.q = q / np.linalg.norm(q)
+
+    def _quaternion_rotate(self, q, v):
+        """Rotate vector v by quaternion q"""
+        # Convert vector to quaternion
+        qv = np.array([0, v[0], v[1], v[2]])
+        # q * v * q_conjugate
+        q_conj = np.array([q[0], -q[1], -q[2], -q[3]])
+        result = self.quaternion_multiply(self.quaternion_multiply(q, qv), q_conj)
+        return result[1:]
 
     def quaternion_multiply(self, q1, q2):
         """Multiply two quaternions."""
@@ -132,57 +159,6 @@ class ComplementaryFilter:
             w1*y2 - x1*z2 + y1*w2 + z1*x2,
             w1*z2 + x1*y2 - y1*x2 + z1*w2
         ])
-
-    def rotation_matrix_to_quaternion(self, R):
-        """Convert rotation matrix to quaternion."""
-        trace = np.trace(R)
-
-        if trace > 0:
-            s = 0.5 / np.sqrt(trace + 1.0)
-            w = 0.25 / s
-            x = (R[2, 1] - R[1, 2]) * s
-            y = (R[0, 2] - R[2, 0]) * s
-            z = (R[1, 0] - R[0, 1]) * s
-        elif R[0, 0] > R[1, 1] and R[0, 0] > R[2, 2]:
-            s = 2.0 * np.sqrt(1.0 + R[0, 0] - R[1, 1] - R[2, 2])
-            w = (R[2, 1] - R[1, 2]) / s
-            x = 0.25 * s
-            y = (R[0, 1] + R[1, 0]) / s
-            z = (R[0, 2] + R[2, 0]) / s
-        elif R[1, 1] > R[2, 2]:
-            s = 2.0 * np.sqrt(1.0 + R[1, 1] - R[0, 0] - R[2, 2])
-            w = (R[0, 2] - R[2, 0]) / s
-            x = (R[0, 1] + R[1, 0]) / s
-            y = 0.25 * s
-            z = (R[1, 2] + R[2, 1]) / s
-        else:
-            s = 2.0 * np.sqrt(1.0 + R[2, 2] - R[0, 0] - R[1, 1])
-            w = (R[1, 0] - R[0, 1]) / s
-            x = (R[0, 2] + R[2, 0]) / s
-            y = (R[1, 2] + R[2, 1]) / s
-            z = 0.25 * s
-
-        return np.array([w, x, y, z])
-
-    def slerp(self, q1, q2, t):
-        """Spherical linear interpolation between quaternions."""
-        dot = np.dot(q1, q2)
-
-        # If negative dot, negate one quaternion to take shorter path
-        if dot < 0.0:
-            q2 = -q2
-            dot = -dot
-
-        # Clamp dot product
-        dot = np.clip(dot, -1.0, 1.0)
-
-        theta = np.arccos(dot)
-
-        if abs(theta) < 0.001:
-            # Quaternions very close, use linear interpolation
-            return q1 * (1 - t) + q2 * t
-
-        return (q1 * np.sin((1-t) * theta) + q2 * np.sin(t * theta)) / np.sin(theta)
 
     def get_quaternion(self):
         """Get current orientation as quaternion [w, x, y, z]."""
@@ -260,7 +236,7 @@ class IMU_Visualizer:
         self.port = port
         self.baudrate = baudrate
         self.serial = None
-        self.filter = ComplementaryFilter(dt=0.01, alpha=0.98)  # Fast response!
+        self.filter = MadgwickFilter(dt=0.01, beta=0.1)  # Madgwick AHRS filter
 
         self.quaternion = np.array([1., 0., 0., 0.])
         self.euler = np.array([0., 0., 0.])
@@ -361,7 +337,7 @@ class IMU_Visualizer:
 
         text = f"""
 ╔════════════════════════════════════╗
-║   FAST IMU VISUALIZATION MODE      ║
+║   9-DOF IMU - MADGWICK FILTER      ║
 ╚════════════════════════════════════╝
 
   EULER ANGLES (degrees)
@@ -377,14 +353,15 @@ class IMU_Visualizer:
   y: {self.quaternion[2]:7.4f}
   z: {self.quaternion[3]:7.4f}
 
-  FILTER: Complementary (98% gyro)
+  FILTER: Madgwick AHRS (β=0.1)
   ────────────────────────────
-  ✓ INSTANT response
-  ✓ No lag
-  ✓ Drift-free (mag + accel correction)
+  ✓ Industry-standard algorithm
+  ✓ Fast & accurate
+  ✓ Drift-free (mag + accel + gyro fusion)
+  ✓ Proven and well-tested
 
 ╔════════════════════════════════════╗
-║  Move the IMU - see instant update!║
+║  Optimal 9-DOF sensor fusion!     ║
 ╚════════════════════════════════════╝
 """
         self.text_display.set_text(text)
@@ -395,12 +372,13 @@ class IMU_Visualizer:
             return
 
         print("\n" + "="*60)
-        print("FAST 3D IMU VISUALIZATION")
+        print("9-DOF IMU VISUALIZATION - MADGWICK FILTER")
         print("="*60)
-        print("\nUsing Complementary Filter (98% gyro trust)")
-        print("  - INSTANT response to movement")
-        print("  - No lag or delay")
-        print("  - Accel + Mag correct for drift")
+        print("\nUsing Madgwick AHRS Algorithm")
+        print("  - Industry-standard sensor fusion")
+        print("  - Fast response with drift correction")
+        print("  - Accel + Gyro + Mag fusion")
+        print("  - Proven, well-tested algorithm")
         print("\nClose window to exit.")
         print("="*60 + "\n")
 
