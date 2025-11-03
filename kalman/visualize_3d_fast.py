@@ -20,12 +20,8 @@ from scipy.spatial.transform import Rotation as R
 
 GYRO_BIAS = np.array([-0.093434, 0.038554, -0.004698])
 ACCEL_SCALE = 1.0
-MAG_OFFSET = np.array([-0.0211, -0.0151, -0.4484])
-MAG_A = np.array([
-    [1.010267, 0.023338, 0.018344],
-    [0.023338, 0.929476, 0.021666],
-    [0.018344, 0.021666, 1.066378]
-])
+MAG_OFFSET = np.array([0.0318, -0.2640, -0.2652])
+MAG_SCALE = np.array([1.2605, 0.9314, 0.8826])
 
 # ============================================================================
 
@@ -296,7 +292,7 @@ class IMU_Visualizer:
                     # Apply calibrations
                     accel = accel_raw * ACCEL_SCALE
                     gyro = gyro_raw - GYRO_BIAS
-                    mag = (mag_raw - MAG_OFFSET) @ MAG_A.T
+                    mag = (mag_raw - MAG_OFFSET) * MAG_SCALE
 
                     # Update filter (FAST!)
                     self.filter.update(accel, gyro, mag)
@@ -382,7 +378,7 @@ class IMU_Visualizer:
         print("\nClose window to exit.")
         print("="*60 + "\n")
 
-        anim = FuncAnimation(self.fig, self.update_plot, interval=20,  # 50Hz update rate
+        anim = FuncAnimation(self.fig, self.update_plot, interval=40,  # 25Hz update rate
                            blit=False, cache_frame_data=False)
         plt.show()
 
