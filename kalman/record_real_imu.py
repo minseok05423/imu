@@ -24,7 +24,7 @@ def find_serial_ports():
 def record_imu_data(port='COM3', baudrate=115200, output_file='real_imu_data.csv'):
     """
     Record IMU data from ESP32 to CSV file.
-    ESP32 format: timestamp,ax,ay,az,gx,gy,gz,mx,my,mz
+    ESP32 format: timestamp_us,ax,ay,az,gx,gy,gz,mx,my,mz,pressure_pa,temperature_c,baro_altitude_m,lat,lon,speed_kmh,altitude_m,gps_time,satellites,hdop,heading_deg
 
     Args:
         port: Serial port
@@ -44,7 +44,7 @@ def record_imu_data(port='COM3', baudrate=115200, output_file='real_imu_data.csv
     print("REAL IMU DATA RECORDER")
     print("="*80)
     print(f"\nRecording to: {output_file}")
-    print("ESP32 should output: timestamp,ax,ay,az,gx,gy,gz,mx,my,mz")
+    print("ESP32 should output: timestamp_us,ax,ay,az,gx,gy,gz,mx,my,mz,pressure_pa,temperature_c,baro_altitude_m,lat,lon,speed_kmh,altitude_m,gps_time,satellites,hdop,heading_deg")
     print("\n" + "="*80)
 
     input("\nPress ENTER to start recording...")
@@ -54,7 +54,7 @@ def record_imu_data(port='COM3', baudrate=115200, output_file='real_imu_data.csv
     print("="*80 + "\n")
 
     data = []
-    start_time = time.time()
+    start_time = time.time() 
     last_print_time = start_time
     recording = True
 
@@ -62,7 +62,7 @@ def record_imu_data(port='COM3', baudrate=115200, output_file='real_imu_data.csv
         with open(output_file, 'w') as f:
             # Write header
             f.write("# Real IMU Data from ESP32\n")
-            f.write("# Format: timestamp,ax,ay,az,gx,gy,gz,mx,my,mz\n")
+            f.write("# Format: timestamp_us,ax,ay,az,gx,gy,gz,mx,my,mz,pressure_pa,temperature_c,baro_altitude_m,lat,lon,speed_kmh,altitude_m,gps_time,satellites,hdop,heading_deg\n")
             f.write(f"# Recorded: {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
 
             while recording:
@@ -72,9 +72,9 @@ def record_imu_data(port='COM3', baudrate=115200, output_file='real_imu_data.csv
                     try:
                         line = ser.readline().decode('utf-8', errors='ignore').strip()
 
-                        # Parse CSV format: timestamp,ax,ay,az,gx,gy,gz,mx,my,mz
+                        # Parse CSV format: timestamp_us,ax,ay,az,gx,gy,gz,mx,my,mz,pressure_pa,temperature_c,baro_altitude_m,lat,lon,speed_kmh,altitude_m,gps_time,satellites,hdop,heading_deg
                         if ',' in line and '{' not in line and not line.startswith('#'):
-                            values = [float(x) for x in line.split(',')]
+                            values = [x for x in line.split(',')]
 
                             if len(values) >= 10:
                                 # ESP32 already provides timestamp

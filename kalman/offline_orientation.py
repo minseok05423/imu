@@ -34,13 +34,17 @@ class IMU_UKF_Offline:
     Optimized for accuracy, not speed.
     """
 
-    def __init__(self, dt=0.01):
+    def __init__(self, dt=0.01, initial_orientation=None):
         self.dt = dt
 
         # State: [qw, qx, qy, qz, wx, wy, wz, gx_bias, gy_bias, gz_bias]
         # Quaternion + angular velocity + gyro bias
         self.dim_x = 10
         self.dim_z = 9  # accel (3) + gyro (3) + mag (3)
+
+        # Adaptive magnetic reference (computed from first measurement)
+        self.mag_reference = None
+        self.current_mag = None  # Store current magnetometer reading for measurement function
 
         # Sigma points
         points = MerweScaledSigmaPoints(n=self.dim_x, alpha=0.1, beta=2., kappa=0)
@@ -54,10 +58,18 @@ class IMU_UKF_Offline:
             points=points
         )
 
-        # Initial state: identity quaternion, zero velocity, zero bias
-        self.ukf.x = np.array([1., 0., 0., 0.,  # quaternion
-                               0., 0., 0.,       # angular velocity
-                               0., 0., 0.])      # gyro bias
+        # Initial state: use provided orientation or identity quaternion
+        if initial_orientation is not None:
+            # Use provided initial orientation
+            self.ukf.x = np.array([initial_orientation[0], initial_orientation[1],
+                                   initial_orientation[2], initial_orientation[3],  # quaternion
+                                   0., 0., 0.,       # angular velocity
+                                   0., 0., 0.])      # gyro bias
+        else:
+            # Default: identity quaternion, zero velocity, zero bias
+            self.ukf.x = np.array([1., 0., 0., 0.,  # quaternion
+                                   0., 0., 0.,       # angular velocity
+                                   0., 0., 0.])      # gyro bias
 
         # Process noise (how much we trust the model)
         self.ukf.Q = np.eye(self.dim_x)
@@ -73,7 +85,12 @@ class IMU_UKF_Offline:
 
         # Initial covariance
         self.ukf.P = np.eye(self.dim_x)
-        self.ukf.P[0:4, 0:4] *= 0.1
+        if initial_orientation is not None:
+            # Lower uncertainty if we have good initial orientation
+            self.ukf.P[0:4, 0:4] *= 0.01
+        else:
+            # Higher uncertainty if using identity
+            self.ukf.P[0:4, 0:4] *= 0.1
         self.ukf.P[4:7, 4:7] *= 1.0
         self.ukf.P[7:10, 7:10] *= 0.01
 
@@ -135,12 +152,15 @@ class IMU_UKF_Offline:
         gravity_world = np.array([0., 0., -9.81])
         accel_expected = self.quaternion_rotate_vector(self.quaternion_conjugate(q), gravity_world)
 
-        # Expected magnetometer: Earth's magnetic field rotated into body frame
-        # Assume field points North with some dip angle
-        # For simplicity, use [1, 0, 0.5] normalized (North with downward component)
-        mag_world = np.array([1., 0., 0.5])
-        mag_world = mag_world / np.linalg.norm(mag_world)
-        mag_expected = self.quaternion_rotate_vector(self.quaternion_conjugate(q), mag_world)
+        # Expected magnetometer: Use adaptive reference like Madgwick
+        # Compute reference from current magnetometer reading (adaptive approach)
+        if self.mag_reference is not None:
+            mag_expected = self.quaternion_rotate_vector(self.quaternion_conjugate(q), self.mag_reference)
+        else:
+            # Fallback: use a reasonable default before reference is computed
+            mag_world = np.array([1., 0., 0.5])
+            mag_world = mag_world / np.linalg.norm(mag_world)
+            mag_expected = self.quaternion_rotate_vector(self.quaternion_conjugate(q), mag_world)
 
         return np.concatenate([accel_expected, gyro_expected, mag_expected])
 
@@ -174,6 +194,10 @@ class IMU_UKF_Offline:
 
     def update(self, accel, gyro, mag):
         """Update step with measurement."""
+        # Compute adaptive magnetic reference on first update (like Madgwick)
+        if self.mag_reference is None:
+            self.mag_reference = self._compute_adaptive_mag_reference(accel, mag)
+
         z = np.concatenate([accel, gyro, mag])
         self.ukf.update(z)
         # Normalize quaternion after update
@@ -190,6 +214,65 @@ class IMU_UKF_Offline:
         q_scipy = [q[1], q[2], q[3], q[0]]
         rot = R.from_quat(q_scipy)
         return rot.as_euler('xyz', degrees=True)
+
+    def _compute_adaptive_mag_reference(self, accel, mag):
+        """
+        Compute adaptive magnetic field reference using Madgwick's approach.
+
+        This computes the reference direction of Earth's magnetic field
+        based on the initial measurements, making the filter invariant to
+        initial yaw orientation.
+
+        Args:
+            accel: Initial accelerometer reading (normalized)
+            mag: Initial magnetometer reading (normalized)
+
+        Returns:
+            mag_reference: Reference magnetic field vector in Earth frame
+        """
+        # Normalize inputs
+        accel_norm = np.linalg.norm(accel)
+        if accel_norm > 0.01:
+            accel = accel / accel_norm
+
+        mag_norm = np.linalg.norm(mag)
+        if mag_norm > 0.01:
+            mag = mag / mag_norm
+
+        # Estimate initial orientation from accelerometer (roll and pitch only)
+        # Assume IMU starts relatively upright
+        roll = np.arctan2(accel[1], accel[2])
+        pitch = np.arctan2(-accel[0], np.sqrt(accel[1]**2 + accel[2]**2))
+        yaw = 0.0  # Arbitrary initial yaw
+
+        # Convert to quaternion
+        cy = np.cos(yaw * 0.5)
+        sy = np.sin(yaw * 0.5)
+        cp = np.cos(pitch * 0.5)
+        sp = np.sin(pitch * 0.5)
+        cr = np.cos(roll * 0.5)
+        sr = np.sin(roll * 0.5)
+
+        q_init = np.array([
+            cr * cp * cy + sr * sp * sy,
+            sr * cp * cy - cr * sp * sy,
+            cr * sp * cy + sr * cp * sy,
+            cr * cp * sy - sr * sp * cy
+        ])
+
+        # Rotate magnetometer reading into Earth frame using initial orientation
+        h = self.quaternion_rotate_vector(q_init, mag)
+
+        # Madgwick's approach: keep only horizontal magnitude and vertical component
+        # This makes yaw reference independent of initial orientation
+        b_x = np.sqrt(h[0]**2 + h[1]**2)  # Horizontal component (North)
+        b_z = h[2]                         # Vertical component (dip angle)
+
+        # Reference field in Earth frame: points North (X) with dip angle (Z)
+        mag_reference = np.array([b_x, 0.0, b_z])
+        mag_reference = mag_reference / np.linalg.norm(mag_reference)
+
+        return mag_reference
 
 
 def rts_smoother(ukf_states, ukf_covariances, dt):
@@ -235,6 +318,103 @@ def rts_smoother(ukf_states, ukf_covariances, dt):
         smoothed_covariances[k] = P_k + C_k @ (P_kp1_smooth - P_kp1_pred) @ C_k.T
 
     return smoothed_states, smoothed_covariances
+
+
+def compute_initial_orientation(accel_samples, mag_samples):
+    """
+    Compute initial orientation from first few sensor samples.
+
+    Args:
+        accel_samples: Array of accelerometer readings [N, 3]
+        mag_samples: Array of magnetometer readings [N, 3]
+
+    Returns:
+        quaternion: Initial orientation [qw, qx, qy, qz]
+        mag_reference: Magnetic field reference in Earth frame
+    """
+    # Average first samples to reduce noise
+    accel_avg = np.mean(accel_samples, axis=0)
+    mag_avg = np.mean(mag_samples, axis=0)
+
+    # Normalize
+    accel_norm = np.linalg.norm(accel_avg)
+    if accel_norm > 0.01:
+        accel_avg = accel_avg / accel_norm
+
+    mag_norm = np.linalg.norm(mag_avg)
+    if mag_norm > 0.01:
+        mag_avg = mag_avg / mag_norm
+
+    # Compute roll and pitch from accelerometer
+    roll = np.arctan2(accel_avg[1], accel_avg[2])
+    pitch = np.arctan2(-accel_avg[0], np.sqrt(accel_avg[1]**2 + accel_avg[2]**2))
+
+    # Compute yaw from magnetometer (after correcting for roll/pitch)
+    # First get rotation from roll/pitch
+    cy = 1.0  # cos(yaw=0)
+    sy = 0.0  # sin(yaw=0)
+    cp = np.cos(pitch)
+    sp = np.sin(pitch)
+    cr = np.cos(roll)
+    sr = np.sin(roll)
+
+    # Quaternion from roll/pitch only
+    q_rp = np.array([
+        cr * cp * cy + sr * sp * sy,
+        sr * cp * cy - cr * sp * sy,
+        cr * sp * cy + sr * cp * sy,
+        cr * cp * sy - sr * sp * cy
+    ])
+
+    # Rotate magnetometer into Earth frame
+    def quaternion_rotate_vector(q, v):
+        qv = np.array([0., v[0], v[1], v[2]])
+        q_conj = np.array([q[0], -q[1], -q[2], -q[3]])
+        w1, x1, y1, z1 = q
+        w2, x2, y2, z2 = qv
+        temp = np.array([
+            w1*w2 - x1*x2 - y1*y2 - z1*z2,
+            w1*x2 + x1*w2 + y1*z2 - z1*y2,
+            w1*y2 - x1*z2 + y1*w2 + z1*x2,
+            w1*z2 + x1*y2 - y1*x2 + z1*w2
+        ])
+        w1, x1, y1, z1 = temp
+        w2, x2, y2, z2 = q_conj
+        result = np.array([
+            w1*w2 - x1*x2 - y1*y2 - z1*z2,
+            w1*x2 + x1*w2 + y1*z2 - z1*y2,
+            w1*y2 - x1*z2 + y1*w2 + z1*x2,
+            w1*z2 + x1*y2 - y1*x2 + z1*w2
+        ])
+        return result[1:]
+
+    h = quaternion_rotate_vector(q_rp, mag_avg)
+
+    # Compute yaw from horizontal component
+    yaw = np.arctan2(h[1], h[0])
+
+    # Full quaternion with yaw
+    cy = np.cos(yaw * 0.5)
+    sy = np.sin(yaw * 0.5)
+    cp = np.cos(pitch * 0.5)
+    sp = np.sin(pitch * 0.5)
+    cr = np.cos(roll * 0.5)
+    sr = np.sin(roll * 0.5)
+
+    q_full = np.array([
+        cr * cp * cy + sr * sp * sy,
+        sr * cp * cy - cr * sp * sy,
+        cr * sp * cy + sr * cp * sy,
+        cr * cp * sy - sr * sp * cy
+    ])
+
+    # Compute magnetic reference (Madgwick approach)
+    b_x = np.sqrt(h[0]**2 + h[1]**2)
+    b_z = h[2]
+    mag_reference = np.array([b_x, 0.0, b_z])
+    mag_reference = mag_reference / np.linalg.norm(mag_reference)
+
+    return q_full, mag_reference
 
 
 def load_imu_data(filename):
@@ -331,9 +511,37 @@ def process_offline(data_file):
     print("  [OK] Accelerometer scaling")
     print("  [OK] Magnetometer hard-iron correction\n")
 
+    # Compute initial orientation from first samples (skip transients)
+    print("Computing initial orientation from first samples...")
+    # Skip first 0.5 seconds to avoid sensor startup transients
+    skip_time = 0.5
+    skip_samples = int(skip_time * avg_sample_rate)
+    init_samples = min(50, N - skip_samples)  # Use 50 samples or less
+
+    if skip_samples + init_samples < N:
+        accel_init = accel[skip_samples:skip_samples+init_samples]
+        mag_init = mag[skip_samples:skip_samples+init_samples]
+        initial_q, mag_ref = compute_initial_orientation(accel_init, mag_init)
+        print(f"  Initial quaternion: [{initial_q[0]:.4f}, {initial_q[1]:.4f}, {initial_q[2]:.4f}, {initial_q[3]:.4f}]")
+
+        # Convert to Euler for display
+        q_scipy = [initial_q[1], initial_q[2], initial_q[3], initial_q[0]]
+        rot = R.from_quat(q_scipy)
+        init_euler = rot.as_euler('xyz', degrees=True)
+        print(f"  Initial orientation: Roll={init_euler[0]:.1f}°, Pitch={init_euler[1]:.1f}°, Yaw={init_euler[2]:.1f}°")
+        print(f"  Mag reference: [{mag_ref[0]:.4f}, {mag_ref[1]:.4f}, {mag_ref[2]:.4f}]\n")
+    else:
+        print("  Not enough samples, using default initialization\n")
+        initial_q = None
+        mag_ref = None
+
     # Forward pass: UKF filtering (with variable dt)
     print("Forward pass: Running UKF...")
-    ukf = IMU_UKF_Offline(dt=avg_dt)
+    ukf = IMU_UKF_Offline(dt=avg_dt, initial_orientation=initial_q)
+
+    # Set the magnetic reference if computed
+    if mag_ref is not None:
+        ukf.mag_reference = mag_ref
 
     forward_states = np.zeros((N, ukf.dim_x))
     forward_covariances = np.zeros((N, ukf.dim_x, ukf.dim_x))

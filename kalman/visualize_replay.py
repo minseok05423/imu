@@ -115,48 +115,64 @@ def update_plot(ax, points, edges, angles, elapsed):
     ax.set_title(f'Time: {elapsed:.2f}s\nRoll: {angles[0]:6.1f}°  '
                 f'Pitch: {angles[1]:6.1f}°  Yaw: {angles[2]:6.1f}°')
 
-def replay_orientation(filename):
-    """Replay orientation data with 3D visualization."""
+def replay_orientation(filename, playback_speed=1.0):
+    """Replay orientation data with 3D visualization.
+
+    Args:
+        filename: Path to orientation CSV file
+        playback_speed: Speed multiplier (1.0 = real-time, 2.0 = 2x speed, etc.)
+    """
     print(f"Loading orientation data from {filename}...")
     timestamps, euler_angles = load_orientation_data(filename)
-    
+
     # Calculate timing
     dt = np.diff(timestamps).mean()
     print(f"Average sample period: {dt:.3f}s ({1/dt:.1f} Hz)")
-    
+    print(f"Playback speed: {playback_speed}x")
+
+    # Downsample to ~30 FPS for smooth visualization (skip frames if needed)
+    target_fps = 30
+    frame_skip = max(1, int((1/dt) / target_fps))
+    indices = np.arange(0, len(euler_angles), frame_skip)
+    timestamps = timestamps[indices]
+    euler_angles = euler_angles[indices]
+    print(f"Downsampled to {len(timestamps)} frames for smooth playback")
+
     # Create 3D plot
     fig = plt.figure(figsize=(10, 8))
     ax = fig.add_subplot(111, projection='3d')
-    
+
     # Create cube visualization
     points, edges = create_cube_points()
-    
+
     print("\nStarting replay...")
     print("Close the window to stop")
     plt.ion()  # Enable interactive mode
-    
+
     try:
         t_start = time.time()
         for i, angles in enumerate(euler_angles):
-            t_target = timestamps[i] - timestamps[0]
+            # Target time adjusted by playback speed
+            t_target = (timestamps[i] - timestamps[0]) / playback_speed
             t_elapsed = time.time() - t_start
-            
-            # Try to maintain timing
+
+            # Try to maintain timing (but don't wait too long if we're behind)
             if t_elapsed < t_target:
-                time.sleep(t_target - t_elapsed)
-            
+                time.sleep(min(0.05, t_target - t_elapsed))  # Cap sleep at 50ms
+
             # Update visualization
-            update_plot(ax, points, edges, angles, t_target)
+            actual_time = timestamps[i] - timestamps[0]
+            update_plot(ax, points, edges, angles, actual_time)
             plt.draw()
             plt.pause(0.001)  # Required for interactive update
-            
-            # Print status every second
-            if i == 0 or (i+1) % int(1/dt) == 0:
-                print(f"Time: {t_target:6.2f}s  |  "
+
+            # Print status periodically
+            if i == 0 or i % 30 == 0:  # Print every ~1 second
+                print(f"Time: {actual_time:6.2f}s  |  "
                       f"Roll: {angles[0]:7.2f}°  "
                       f"Pitch: {angles[1]:7.2f}°  "
                       f"Yaw: {angles[2]:7.2f}°")
-    
+
     except KeyboardInterrupt:
         print("\nReplay stopped by user")
     finally:
@@ -165,10 +181,12 @@ def replay_orientation(filename):
 
 if __name__ == "__main__":
     if len(sys.argv) < 2:
-        print("Usage: python visualize_replay.py <orientation_data.csv>")
+        print("Usage: python visualize_replay.py <orientation_data.csv> [speed]")
         print("\nExample:")
         print("  python visualize_replay.py real_imu_data_orientations.csv")
+        print("  python visualize_replay.py real_imu_data_orientations.csv 2.0  # 2x speed")
         sys.exit(1)
-    
+
     data_file = sys.argv[1]
-    replay_orientation(data_file)
+    playback_speed = float(sys.argv[2]) if len(sys.argv) > 2 else 1.0
+    replay_orientation(data_file, playback_speed)
